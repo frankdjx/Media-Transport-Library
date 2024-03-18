@@ -47,6 +47,8 @@ struct mt_xdp_queue {
   uint32_t tx_free_thresh;
   uint32_t tx_full_thresh;
 
+  bool tx_bulk;
+
   struct mt_tx_xdp_entry* tx_entry;
   struct mt_rx_xdp_entry* rx_entry;
 
@@ -508,6 +510,9 @@ static int xdp_queue_init(struct mt_xdp_priv* xdp, struct mt_xdp_queue* xq) {
     return ret;
   }
 
+  /* disable now since no perf improvement */
+  xq->tx_bulk = false;
+
   return 0;
 }
 
@@ -553,8 +558,8 @@ static void xdp_tx_wakeup(struct mt_xdp_queue* xq) {
   }
 }
 
-static uint16_t xdp_tx(struct mtl_main_impl* impl, struct mt_xdp_queue* xq,
-                       struct rte_mbuf** tx_pkts, uint16_t nb_pkts) {
+static uint16_t xdp_tx_1way(struct mtl_main_impl* impl, struct mt_xdp_queue* xq,
+                            struct rte_mbuf** tx_pkts, uint16_t nb_pkts) {
   enum mtl_port port = xq->port;
   // uint16_t q = xq->q;
   struct rte_mempool* mbuf_pool = xq->mbuf_pool;
@@ -618,6 +623,94 @@ static uint16_t xdp_tx(struct mtl_main_impl* impl, struct mt_xdp_queue* xq,
 exit:
   if (tx) {
     dbg("%s(%d, %u), submit %u\n", __func__, port, q, tx);
+    xsk_ring_prod__submit(pd, tx);
+    xdp_tx_wakeup(xq); /* do we need wakeup for every submit? */
+    if (stats) {
+      stats->tx_packets += tx;
+      stats->tx_bytes += tx_bytes;
+    }
+    xq->stat_tx_submit++;
+    xq->stat_tx_pkts += tx;
+    xq->stat_tx_bytes += tx_bytes;
+  } else {
+    xdp_tx_poll_done(xq);
+  }
+  return tx;
+}
+
+static uint16_t xdp_tx_bulk(struct mtl_main_impl* impl, struct mt_xdp_queue* xq,
+                            struct rte_mbuf** tx_pkts, const uint16_t nb_pkts) {
+  enum mtl_port port = xq->port;
+  // uint16_t q = xq->q;
+  struct rte_mempool* mbuf_pool = xq->mbuf_pool;
+  uint16_t tx = 0;
+  struct xsk_ring_prod* pd = &xq->tx_prod;
+  struct mtl_port_status* stats = mt_if(impl, port)->dev_stats_sw;
+  uint64_t tx_bytes = 0;
+
+  xdp_tx_check_free(xq); /* do we need check free threshold for every tx burst */
+
+  uint32_t prod_free = xsk_prod_nb_free(&xq->tx_prod, xq->umem_ring_size);
+  if (prod_free < xq->tx_full_thresh) { /* tx_prod is full */
+    xq->stat_tx_prod_full++;
+    return 0;
+  }
+
+  struct rte_mbuf* locals_bulk[nb_pkts];
+  int ret = rte_pktmbuf_alloc_bulk(mbuf_pool, locals_bulk, nb_pkts);
+  if (ret < 0) {
+    err("%s(%d, %u), locals_bulk %u alloc fail\n", __func__, port, xq->q, nb_pkts);
+    xq->stat_tx_mbuf_alloc_fail++;
+    return 0;
+  }
+
+  uint32_t idx = 0;
+  uint32_t reserve = xsk_ring_prod__reserve(pd, nb_pkts, &idx);
+  if (reserve != nb_pkts) {
+    err("%s(%d, %u), socket_tx reserve %u only get %u\n", __func__, port, xq->q, nb_pkts,
+        reserve);
+    xq->stat_tx_prod_reserve_fail++;
+    rte_pktmbuf_free_bulk(locals_bulk, nb_pkts);
+    xdp_tx_wakeup(xq);
+    goto exit;
+  }
+  dbg("%s(%d, %u), pd idx %u\n", __func__, port, xq->q, idx);
+
+  for (uint16_t i = 0; i < nb_pkts; i++) {
+    struct rte_mbuf* m = tx_pkts[i];
+    struct rte_mbuf* local = locals_bulk[i];
+    struct xdp_desc* desc = xsk_ring_prod__tx_desc(pd, idx + i);
+    desc->len = m->pkt_len;
+    uint64_t addr =
+        (uint64_t)local - (uint64_t)xq->umem_buffer - xq->mbuf_pool->header_size;
+    uint64_t offset =
+        rte_pktmbuf_mtod(local, uint64_t) - (uint64_t)local + xq->mbuf_pool->header_size;
+    void* pkt = xsk_umem__get_data(xq->umem_buffer, addr + offset);
+    offset = offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT;
+    desc->addr = addr | offset;
+
+    struct rte_mbuf* n = m;
+    uint16_t nb_segs = m->nb_segs;
+    for (uint16_t seg = 0; seg < nb_segs; seg++) {
+      rte_memcpy(pkt, rte_pktmbuf_mtod(n, void*), n->data_len);
+      pkt += n->data_len;
+      /* point to next */
+      n = n->next;
+    }
+
+    tx_bytes += desc->len;
+    dbg("%s(%d, %u), tx local mbuf %p umem pkt %p addr 0x%" PRIu64 "\n", __func__, port,
+        xq->q, local, pkt, addr);
+  }
+  xq->stat_tx_copy += nb_pkts;
+  tx += nb_pkts;
+
+  /* free the tx_pkts */
+  rte_pktmbuf_free_bulk(tx_pkts, nb_pkts);
+
+exit:
+  if (tx) {
+    dbg("%s(%d, %u), submit %u\n", __func__, port, xq->q, tx);
     xsk_ring_prod__submit(pd, tx);
     xdp_tx_wakeup(xq); /* do we need wakeup for every submit? */
     if (stats) {
@@ -814,7 +907,8 @@ int mt_dev_xdp_init(struct mt_interface* inf) {
   inf->port_id = inf->port;
   inf->xdp = xdp;
   inf->feature |= MT_IF_FEATURE_TX_MULTI_SEGS;
-  info("%s(%d), cnt %u\n", __func__, port, xdp->queues_cnt);
+  info("%s(%d), queues_cnt %u, %s mode\n", __func__, port, xdp->queues_cnt,
+       xdp->flags & XDP_F_ZERO_COPY ? "zero copy" : "copy");
   return 0;
 }
 
@@ -927,7 +1021,11 @@ int mt_tx_xdp_put(struct mt_tx_xdp_entry* entry) {
 
 uint16_t mt_tx_xdp_burst(struct mt_tx_xdp_entry* entry, struct rte_mbuf** tx_pkts,
                          uint16_t nb_pkts) {
-  return xdp_tx(entry->parent, entry->xq, tx_pkts, nb_pkts);
+  struct mt_xdp_queue* xq = entry->xq;
+  if (xq->tx_bulk)
+    return xdp_tx_bulk(entry->parent, xq, tx_pkts, nb_pkts);
+  else
+    return xdp_tx_1way(entry->parent, xq, tx_pkts, nb_pkts);
 }
 
 static inline int xdp_socket_update_dp(struct mtl_main_impl* impl, int ifindex,
